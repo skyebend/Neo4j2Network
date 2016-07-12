@@ -1,0 +1,236 @@
+---
+title: "Dynamic networks in Neo4J"
+author: "skyebend"
+date: "July 11, 2016"
+output: html_document
+---
+
+Graph database seem to have really matured in the last year or so, and even appeared in some very high-profile current events (i.e Panama Papers https://panamapapers.icij.org/).  I'm curious to see how well Neo4J supports dynamic network data.  
+
+# Setup
+
+First, installed Neo4j from instructions at http://debian.neo4j.org/  and installed the `RNeo4j` R package.  Then pointed the web browser at http://localhost:7474/browser/ and did the password configuration.  The Neo4J query browser tool is absolutely lovely!  Can view data in tabular form or as a network visualization.  
+
+Loaded the libraries in R, and opened a connection to the database. 
+
+```{r}
+library(RNeo4j)
+n4jConnection <- startGraph("http://localhost:7474/db/data/", username="neo4j", password="network")
+```
+
+```{r,include=FALSE}
+# have to empty the database from the last run
+cypher(n4jConnection,'MATCH (n) OPTIONAL MATCH (n)-[r]-() DELETE n,r')
+```
+
+# Basic temporal data
+
+Load some example data.  This is my go-to example of the McFarland classroom data of time-stamped continuous time conversation interactions. 
+
+```{r,message=FALSE,results='hide'}
+library(networkDynamic) # data structures for dynamic networks
+```
+
+```{r}
+data(McFarland_cls33_10_16_96)
+head(as.data.frame(cls33_10_16_96))
+list.vertex.attributes(cls33_10_16_96)
+```
+For this network, onset and terminus are the same timestamp, so should be easy to model very literally in the database.
+
+Create vertices/nodes for the network in the database.  There must be a way to load more than one vertex at a time? Need to store the 'node' objects in an array so we can use them to construct the edges later.
+
+```{r}
+vdata<-data.frame(data_id=cls33_10_16_96%v%'data_id',
+                  gender=cls33_10_16_96%v%'gender',
+                  type = cls33_10_16_96%v%'type',
+                  vertex_index = cls33_10_16_96%v%'vertex.names')
+
+nodes<-lapply(1:network.size(cls33_10_16_96), function(v){
+  createNode(n4jConnection, "Person",
+             data_id=vdata[v,'data_id'],
+             gender=vdata[v,'gender'],
+             type=vdata[v,'type'],
+             vertex_index=vdata[v,'vertex_index'])
+})
+```
+
+Check if it worked, by querying out all of the node objects onto a list
+
+```{r}
+head( cypherToList(n4jConnection,"MATCH (n) RETURN n;") )
+```
+
+Now load the edges into the database.  Use the tail (from) and head (to) vertex indices to look up the appropriate node object in R.  Also store the onset time of the event as a property of the relation.  Probably just pull the nodes out with the query, but not yet sure how to impose the correct ordering to ensure they match up.
+
+```{r}
+el<-as.data.frame(cls33_10_16_96)
+for (e in 1:nrow(el)){
+  createRel(nodes[[el[e,'tail']]],
+            'SPOKE_TO',
+            nodes[[el[e,'head']]],
+            onset=el[e,'onset'])
+}
+```
+
+(There must be a faster way to do this, as it took about a minute to load ~700 edge events.)
+
+Now query the edgelist and peek to see that it worked. 
+
+```{r}
+tel<-cypher(n4jConnection,"MATCH (n)-[r:SPOKE_TO]->(m) RETURN r.onset, n.vertex_index, m.vertex_index")
+head(tel)
+```
+
+I like that the Cypher language queries are built almost by 'sketching out' the chain of relationships I'm interested in. So a directed relationship is `(vertex)-[edge]->(vertex)`.
+
+Now I'll make the timed edgelist into a `networkDynamic` object
+
+
+```{r}
+cls33FromN4J<-networkDynamic(edge.spells = data.frame(tel$'r.onset',
+                                                      tel$'r.onset',
+                                                      tel$'n.vertex_index',
+                                                      tel$'m.vertex_index'))
+```
+
+Its a `networkDynamic` object, so we can easily make it into an animation.
+
+```{r,message=FALSE,results='hide'}
+library(ndtv)           # animation and vis for dynamic networks
+```
+
+Render the first 20 minutes of it as an HTML5 movie, in 5-min increments
+
+```{r,message=FALSE}
+compute.animation(cls33FromN4J,slice.par = list(start=0,
+                                                end=20,
+                                                interval=1,
+                                                aggregate.dur=5,
+                                                rule='earliest'))
+render.d3movie(cls33FromN4J,output.mode = 'htmlWidget')
+```
+
+(more on this of course at http://statnet.csde.washington.edu/workshops/SUNBELT/current/ndtv/ndtv_workshop.html )
+
+
+# A more flexible temporal model
+
+In the example above, I'm working with a network of instantaneous events, so its possible to model it with each 'edge-spell' in networkDynamic becoming a separate 'relation' with an `onset` property in Neo4j.  The nodes and edges in the R network object roughly correspond to the nodes and edges in the Neo4J representation. 
+
+It will be a bit more complicated if I want to have a single relationship with multiple activity spells associated with it. Can this be done by introducing multiple relation types, linking from vertices to edge, and from edges to edge_spells? 
+
+A temporal model like this is proposed in https://github.com/SocioPatterns/neo4j-dynagraph/wiki/Representing-time-dependent-graphs-in-Neo4j  (http://dl.acm.org/citation.cfm?id=2484442) but I dont think it is necessary to go to that full level of complexity.  Also it is assuming a mapping of edges and vertices to 'frames' (probably would be slices or a network sequence in networkDynamic?) which might be tricky when working with continous time data. 
+
+I'm not sure yet if Neo4j supports separate databases, so first have to delete the old data to load a new data object (ouch, there must be a better way?)
+
+```{r}
+cypher(n4jConnection,'MATCH (n) OPTIONAL MATCH (n)-[r]-() DELETE n,r')
+```
+
+Need a dataset where edges have durations to try this out.  Load the discrete time simulation dataset from the `ndtv` package.  
+
+```{r}
+data("short.stergm.sim")
+head(as.data.frame(short.stergm.sim))
+```
+
+Now constrct the mapping in the database. First create the database nodes for the network's vertices.  
+
+```{r}
+
+vertex_nodes<-lapply(1:network.size(short.stergm.sim), function(v){
+  createNode(n4jConnection, "VERTEX",
+             vertex_index=v,
+             label=network.vertex.names(short.stergm.sim)[v]
+             )
+})
+
+```
+
+Create database nodes for the edges, and link them to their incident vertices
+
+```{r}
+edge_nodes<-lapply(valid.eids(short.stergm.sim),function(e){
+  from_id <- short.stergm.sim$mel[[e]]$outl # ouch, had to reach into the network list structure :-(
+  to_id <- short.stergm.sim$mel[[e]]$inl
+  eNode <- createNode(n4jConnection, "EDGE",
+             edge_id=e,
+             from_id=from_id,
+             to_id=to_id
+             )
+  # also create relations to vertices while in the looop
+  createRel(vertex_nodes[[from_id]],'IS_SOURCE_OF',eNode)
+  createRel(vertex_nodes[[to_id]],'IS_TARGET_OF',eNode)
+  return(eNode)
+})
+```
+
+Now create nodes for the activity spells and link them
+
+```{r}
+tel <-as.data.frame(short.stergm.sim)
+for (s in 1:nrow(tel)){
+  # also create activity spell nodes ...
+  splNode<-createNode(n4jConnection,"SPELL",
+                      onset=tel$onset[s],
+                      terminus=tel$terminus[s],
+                      label=paste('(',tel$onset[s],'-',tel$terminus[s],')'))
+  createRel(splNode,"ACTIVE",edge_nodes[[tel$edge.id[s]]])
+}
+
+```
+
+Can now take a peek at this in the Neo4J query browser, showing just two of the original network vertices to get a better understanding of the data model.  The lovely graphical query browser plotted the spells in green, edges in red, and vertices in purple.
+
+<img src='activityNetworkImage.png'>
+
+(Aside: I think this kind of view is wonderful for understanding the data model, but I find it generally hard to visually understand larger network visualizations that include multiplex relation types. What does distance in such a space mean?)
+
+Notice that the elements of the graph in the database no longer correspond directly to the elements of network we are representing (we have 'edge nodes' :-)
+
+I'm gonna skip creating activity spells for the vertices, since in this network they are always active.  But it should now be possible to query a time range and reconstruct a graph by selecting the spell nodes by their activation times, and then the associated edges and their vertices.
+
+
+So to reconstruct the timed edgelist for the dynamic network querying elements that are active anytime from time 0 until time 26:
+
+```{r}
+cypher(n4jConnection,'MATCH (s:SPELL)-->(e:EDGE) 
+       WHERE s.onset>=0 AND s.terminus < 26 
+       RETURN s.onset, s.terminus,e.from_id,e.to_id')
+```
+
+I can also pull the VERTEX nodes if I wanted data attached to them (label, etc) instead of using the properties I attached to the edges. 
+
+```{r}
+head(cypher(n4jConnection,'MATCH (s:SPELL)-->(e:EDGE)--(v:VERTEX) 
+       WHERE s.onset>=0 AND s.terminus < 26 
+       RETURN s.onset, s.terminus,e.from_id,e.to_id, v.label'))
+```
+
+If I wanted to make a function to plot the aggregate graph over an arbitrary time interval, drawing widths of edges proportional to the sum of their total activity durations...
+
+```{r}
+plotAggNetFromNeo<-function(con,start,end){
+  # query the edgelist, using parameters for start and end bounds
+  el<-cypher(con,'MATCH (s:SPELL)-->(e:EDGE) 
+         WHERE s.onset>={start} AND s.terminus < {end} 
+         RETURN e.edge_id, e.from_id, e.to_id,sum(s.terminus-s.onset)',
+         start=start,end=end)
+  # construct a static networkobject
+  net <- as.network.matrix(el[,2:4],matrix.type='edgelist',
+                           ignore.eval = FALSE,names.eval='duration',
+                           directed=FALSE)
+  # aggregate it (preserving counts) and plot
+  plot(net,edge.lwd='duration',edge.col='#55555555',displaylabels=TRUE,
+       main=paste('network from',start,'until',end))
+}
+
+plotAggNetFromNeo(n4jConnection,0,26)
+plotAggNetFromNeo(n4jConnection,0,3)
+```
+
+# Neo4J + R = cool!
+
+I'm finding the Cypher queries easier to think about than SQL joins. The next project I have that involves extracting relationships from a large pool of relational data will probably use a graph database.  So now the question is, which operations will be more efficient to do at the Neo4J level, and which ones in the networkDynamic? :-)
+
